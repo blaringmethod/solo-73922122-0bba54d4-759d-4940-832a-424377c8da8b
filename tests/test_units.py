@@ -1,11 +1,13 @@
-"""单元自测：受限语法解析、纯 Python 判定、z3 全量兼容判定。
+"""单元自测：受限语法解析、纯 Python 判定、z3 全量兼容判定、报文编解码。
 运行：python3 tests/test_units.py
 """
+import itertools
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
+from codec import CodecError, build_codec  # noqa: E402
 from schema_spec import SchemaError, message_valid, parse_schema  # noqa: E402
 from solver import check_compatibility, find_counterexample  # noqa: E402
 
@@ -163,5 +165,137 @@ ok("z3:枚举越界反例", cex is not None and cex.get("lv") == 3)
 problems = check_compatibility([(1, fw(-40, 100))], [("p1", fw(-10, 50)), ("p2", fw(-40, 100))])
 ok("z3:交叉检查定位拒收程序", len(problems) == 1 and problems[0]["program_id"] == "p1"
    and problems[0]["firmware_version"] == 1)
+
+
+# ---------- 报文编解码 ----------
+
+def expect_codec_error(name, doc):
+    try:
+        build_codec(S(doc))
+    except CodecError:
+        PASS.append(name)
+        return
+    raise AssertionError(f"FAILED(编解码应拒绝但未拒绝): {name}")
+
+
+def flat(props, required=()):
+    return {"type": "object", "properties": props, "required": list(required),
+            "additionalProperties": False}
+
+
+RANGE = lambda lo, hi: {"type": "integer", "minimum": lo, "maximum": hi}  # noqa: E731
+
+
+def brute_force(codec, doc):
+    """枚举全部候选报文（字段取缺省或各分支值域内任一值），用独立判定器筛出合法报文。"""
+    MISSING = object()
+    values = {}
+    for f in codec.fields:
+        vs = set()
+        for doms in codec.branch_domains:
+            if f in doms:
+                dom = doms[f]
+                if dom.lo is not None:
+                    vs.update(range(dom.lo, dom.hi + 1))
+                if dom.allow_null:
+                    vs.add(None)
+        values[f] = sorted(vs, key=lambda v: (v is not None, v))
+    msgs = []
+    for combo in itertools.product(*[[MISSING] + values[f] for f in codec.fields]):
+        msgs.append({f: v for f, v in zip(codec.fields, combo) if v is not MISSING})
+    valid = [m for m in msgs if message_valid(m, S(doc))]
+    return valid
+
+
+# 单分支：缺省 / null / 整数是不同状态
+doc_flat = flat({"a": RANGE(0, 2), "b": {"enum": [None, 1]}}, required=["a"])
+c = build_codec(S(doc_flat))
+ok("编解码:合法报文总数", c.total == 9)
+ok("编解码:最小位宽", c.width == 4 and c.total <= 2 ** c.width < 2 * c.total)
+ok("编解码:缺省与null不同码",
+   c.encode({"a": 0})["code"] != c.encode({"a": 0, "b": None})["code"])
+for m in [{"a": 0}, {"a": 2, "b": 1}, {"a": 1, "b": None}]:
+    e = c.encode(m)
+    ok(f"编解码:往返 {m}", c.decode(e["code"])["message"] == m)
+    ok(f"编解码:键顺序无关 {m}", c.encode(dict(reversed(list(m.items()))))["code"] == e["code"])
+
+# 多分支重叠：同一报文只占一个码；码值与分支顺序无关
+doc_any = {"anyOf": [
+    flat({"a": RANGE(0, 3), "b": RANGE(0, 1)}, required=["a"]),
+    flat({"a": RANGE(0, 1), "b": RANGE(0, 1)}, required=["a", "b"]),
+    flat({"z": {"type": "null"}}, required=["z"]),
+]}
+c1 = build_codec(S(doc_any))
+c2 = build_codec(S({"anyOf": list(reversed(doc_any["anyOf"]))}))
+ok("编解码:anyOf 分支顺序不改变码", all(
+    c1.encode(m)["code"] == c2.encode(m)["code"]
+    for m in [{"a": 0}, {"a": 3}, {"a": 0, "b": 1}, {"z": None}]))
+ok("编解码:重叠报文只占一个码", len({c1.encode({"a": 0, "b": 1})["code"],
+                                     c1.encode({"a": 0})["code"]}) == 2)
+ok("编解码:并集总数为互斥分区", c1.total == sum(c1.own_counts))
+
+# 穷举核对：码是全部合法报文的一一映射，未用码值被明确拒绝
+for label, doc in [("平面", doc_flat), ("anyOf", doc_any)]:
+    codec = build_codec(S(doc))
+    valid = brute_force(codec, doc)
+    ok(f"穷举:{label}合法报文数一致", len(valid) == codec.total)
+    codes = {}
+    for m in valid:
+        code = codec.encode(m)["code"]
+        assert code not in codes, (m, code)
+        codes[code] = m
+        assert codec.decode(code)["message"] == m
+    ok(f"穷举:{label}码一一对应且可逆", len(codes) == len(valid))
+    ok(f"穷举:{label}位宽最小", len(codes) <= 2 ** codec.width < 2 * len(codes))
+    bad = [format(i, f"0{codec.width}b") for i in range(2 ** codec.width)
+           if format(i, f"0{codec.width}b") not in codes]
+    rejected = 0
+    for code in bad:
+        try:
+            codec.decode(code)
+        except CodecError:
+            rejected += 1
+    ok(f"穷举:{label}未使用码值均判无效", rejected == len(bad))
+
+# 大区间：不枚举报文也能编码（组合计数）
+doc_big = flat({"t": RANGE(-10 ** 12, 10 ** 12), "h": RANGE(0, 100)}, required=["t"])
+c = build_codec(S(doc_big))
+ok("编解码:大区间总数", c.total == (2 * 10 ** 12 + 1) * 102)
+m = {"t": -999999999999, "h": 100}
+ok("编解码:大区间往返", c.decode(c.encode(m)["code"])["message"] == m)
+
+# 错误与不支持格式
+codec = build_codec(S(doc_flat))
+for label, fn in [
+    ("未知字段", lambda: codec.encode({"a": 1, "x": 2})),
+    ("越界整数", lambda: codec.encode({"a": 3})),
+    ("浮点", lambda: codec.encode({"a": 1.5})),
+    ("布尔", lambda: codec.encode({"a": True})),
+    ("缺必填", lambda: codec.encode({})),
+    ("非对象报文", lambda: codec.encode([1])),
+    ("非二进制码", lambda: codec.decode("01x")),
+    ("位宽不符", lambda: codec.decode("01")),
+    ("未使用码值", lambda: codec.decode("1111")),
+    ("空码", lambda: codec.decode("")),
+]:
+    try:
+        fn()
+    except CodecError:
+        PASS.append(f"编解码错误:{label}")
+    else:
+        raise AssertionError(f"FAILED(应报错): {label}")
+
+expect_codec_error("编解码不支持:字符串字段", flat({"s": {"enum": ["x"]}}))
+expect_codec_error("编解码不支持:单侧有界", flat({"t": {"type": "integer", "minimum": 0}}))
+expect_codec_error("编解码不支持:无界整数", flat({"t": {"type": "integer"}}))
+expect_codec_error("编解码不支持:不连续枚举",
+                   flat({"t": {"type": "integer", "enum": [1, 3]}}))
+expect_codec_error("编解码不支持:4个分支", {"anyOf": [
+    flat({"a": RANGE(0, 1)}) for _ in range(4)]})
+expect_codec_error("编解码不支持:7个字段", flat({f"f{i}": RANGE(0, 1) for i in range(7)}))
+# 空对象格式只有唯一的合法报文 {}：位宽仍取最小正位宽 1
+c_empty = build_codec(S(flat({})))
+ok("编解码:空对象唯一报文", c_empty.total == 1 and c_empty.width == 1
+   and c_empty.decode(c_empty.encode({})["code"])["message"] == {})
 
 print(f"全部 {len(PASS)} 项单元自测通过")

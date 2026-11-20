@@ -32,6 +32,13 @@
     <div class="card">
       <b>v{{ f.version }}</b> <span class="muted">{{ f.created_at }}</span>
       <pre>{{ f.doc | tojson }}</pre>
+      {% set info = codec_infos[f.version] %}
+      {% if info.supported %}
+      <p class="muted">编解码可用：位宽 <b>{{ info.width }}</b> bit，合法报文共
+        {{ info.total }} 个，{{ info.branch_count }} 个分支、{{ info.field_count }} 个字段。</p>
+      {% else %}
+      <p class="muted err">编解码不可用：{{ info.error }}</p>
+      {% endif %}
     </div>
     {% else %}<p class="muted">尚未登记固件格式。</p>{% endfor %}
   </div>
@@ -64,6 +71,77 @@
       <button type="submit">校验并发布程序格式</button>
     </form>
   </div>
+</div>
+
+<h2>报文编解码</h2>
+<div class="card" id="codec">
+  <p class="muted">选择已发布的固件版本后：输入 JSON 报文可查看位宽与二进制码；输入二进制码可还原 JSON 对象。
+  编解码只取决于该版固件格式本身，不受 JSON 键顺序、后续版本发布或服务重启影响。
+  支持的格式：平面对象或至多 3 个 anyOf 分支，合计至多 6 个字段，字段值为双侧有界的整数区间和/或 null。
+  码为定长二进制串，位宽是能容纳该版全部合法报文的最小正位宽。</p>
+
+  {% if firmwares %}
+  {% set selected = (codec_result.version | string) if codec_result else (firmwares[-1].version | string) %}
+  <form method="post" action="/models/{{ model.name }}/codec" id="codec-form">
+    <p>
+      <label>固件版本：
+        <select id="codec-version" name="version" onchange="codecVersionChanged()">
+          {% for f in firmwares %}
+          <option value="{{ f.version }}" {% if f.version|string == selected %}selected{% endif %}>
+            v{{ f.version }}{% if not codec_infos[f.version].supported %}（不支持编解码）{% endif %}
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+      <span id="codec-meta" class="muted"></span>
+      <span id="codec-unsupported" class="err"></span>
+    </p>
+    <div class="cols">
+      <div>
+        <h3 style="margin-top:0">报文 → 码</h3>
+        <textarea id="codec-encode" name="encode_text" placeholder='{"temp": 21, "site": 1}'>{{ codec_result.input if codec_result and codec_result.kind == "encode" else "" }}</textarea>
+        <button type="submit" name="action" value="encode">编码</button>
+      </div>
+      <div>
+        <h3 style="margin-top:0">码 → 报文</h3>
+        <textarea id="codec-decode" name="decode_text" placeholder="如 001011">{{ codec_result.input if codec_result and codec_result.kind == "decode" else "" }}</textarea>
+        <button type="submit" name="action" value="decode">解码</button>
+      </div>
+    </div>
+    <p class="muted">点击哪个按钮就使用哪一栏的内容。</p>
+  </form>
+  {% else %}
+  <p class="muted">尚未登记固件格式，暂无可用版本。</p>
+  {% endif %}
+
+  {% if codec_result %}
+    {% if codec_result.ok %}
+      {% if codec_result.kind == "encode" %}
+      <div class="card notice-ok">
+        <h3>✔ 编码成功（固件 v{{ codec_result.version }}）</h3>
+        <p>位宽 <b>{{ codec_result.width }}</b> bit；合法报文共 {{ codec_result.total }} 个；
+           命中第 {{ codec_result.branch }} / {{ codec_result.branch_count }} 个（规范化后）分支。</p>
+        <p>二进制码：</p>
+        <pre id="codec-output">{{ codec_result.code }}</pre>
+        <p class="muted">码值 {{ codec_result.index }}（0 起）；各字段的缺省与显式 null 使用不同状态。</p>
+      </div>
+      {% else %}
+      <div class="card notice-ok">
+        <h3>✔ 解码成功（固件 v{{ codec_result.version }}）</h3>
+        <p>位宽 <b>{{ codec_result.width }}</b> bit；码值 {{ codec_result.index }}；
+           属于第 {{ codec_result.branch }} / {{ codec_result.branch_count }} 个（规范化后）分支。</p>
+        <p>还原的 JSON 对象：</p>
+        <pre>{{ codec_result.message_text }}</pre>
+      </div>
+      {% endif %}
+    {% else %}
+    <div class="card notice-bad">
+      <h3>✘ {{ "编码失败" if codec_result.kind == "encode" else "解码失败" }}</h3>
+      <p>{{ codec_result.error }}</p>
+      {% if codec_result.input %}<p class="muted">输入：</p><pre>{{ codec_result.input }}</pre>{% endif %}
+    </div>
+    {% endif %}
+  {% endif %}
 </div>
 
 <h2>示例（点击填入编辑器）</h2>
@@ -110,5 +188,23 @@ function fillSnippet(btn) {
     document.getElementById('prog_schema').scrollIntoView({behavior: 'smooth'});
   }
 }
+
+const CODEC_INFOS = {{ codec_infos | script_json }};
+function codecVersionChanged() {
+  const sel = document.getElementById('codec-version');
+  if (!sel) return;
+  const info = CODEC_INFOS[sel.value];
+  const meta = document.getElementById('codec-meta');
+  const warn = document.getElementById('codec-unsupported');
+  if (!info) { meta.textContent = ''; warn.textContent = ''; return; }
+  if (info.supported) {
+    meta.textContent = `位宽 ${info.width} bit · 合法报文 ${info.total} 个 · ${info.branch_count} 个分支 · ${info.field_count} 个字段`;
+    warn.textContent = '';
+  } else {
+    meta.textContent = '';
+    warn.textContent = `该版本不支持编解码：${info.error}`;
+  }
+}
+codecVersionChanged();
 </script>
 {% endblock %}

@@ -1,4 +1,4 @@
-"""内置示例：温度扩范围、质控码缺省。供网页一键填入编辑器。"""
+"""内置示例：温度扩范围、质控码缺省、anyOf、编解码。供网页一键填入编辑器。"""
 
 TEMP_FW_V1 = {
     "type": "object",
@@ -97,6 +97,40 @@ ANYOF_PROG = {
     ]
 }
 
+CODEC_FW = {
+    "type": "object",
+    "properties": {
+        "temp": {"type": "integer", "minimum": -40, "maximum": 100},
+        "site": {"type": "integer", "minimum": 1, "maximum": 2},
+        "qc": {"enum": [None, 0, 1, 2]},
+    },
+    "required": ["temp"],
+    "additionalProperties": False,
+}
+
+CODEC_FW_ANYOF = {
+    "anyOf": [
+        {
+            "type": "object",
+            "properties": {
+                "level": {"type": "integer", "minimum": 0, "maximum": 3},
+                "site": {"type": "integer", "minimum": 1, "maximum": 2},
+            },
+            "required": ["level"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "level": {"type": "integer", "minimum": 0, "maximum": 1},
+            },
+            "required": ["level"],
+            "additionalProperties": False,
+        },
+    ]
+}
+
+
 EXAMPLES = [
     {
         "title": "示例一：温度扩范围",
@@ -139,6 +173,22 @@ EXAMPLES = [
         "snippets": [
             {"label": "程序 multiplexer：anyOf 两种报文", "target": "program",
              "program_id": "multiplexer", "doc": ANYOF_PROG},
+        ],
+    },
+    {
+        "title": "示例四：报文编解码",
+        "story": ("为某一版固件确定定长二进制码。先发布下面的固件（建议另起新型号，避免与已有程序冲突），"
+                  "再在「报文编解码」中选择该版本：输入 {\"temp\": 21, \"site\": 1} 可看到位宽与码；"
+                  "把码贴回右侧可还原 JSON。qc 缺省与 qc=null 是不同的码；"
+                  "第二个格式演示 anyOf 分支重叠时同一报文只占一个码。"),
+        "steps": ["发布固件：temp -40~100、site 1~2、qc 可为 null/0/1/2",
+                  "在报文编解码中选择该版本并编码/解码",
+                  "发布固件：anyOf 两个 level 分支（重叠），观察字段数与位宽"],
+        "snippets": [
+            {"label": "固件：可编解码（整数区间 + null）", "target": "firmware",
+             "doc": CODEC_FW},
+            {"label": "固件：anyOf 重叠分支（可编解码）", "target": "firmware",
+             "doc": CODEC_FW_ANYOF},
         ],
     },
 ]

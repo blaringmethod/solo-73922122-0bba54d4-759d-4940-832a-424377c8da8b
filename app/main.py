@@ -7,14 +7,17 @@ from pathlib import Path
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from markupsafe import Markup
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 import service
+from codec import CodecError, build_codec, codec_summary
 from db import (Base, DeviceModel, FirmwareFormat, ProgramFormat, PublishLog,
                 SessionLocal, engine)
 from examples import EXAMPLES
+from schema_spec import SchemaError, parse_schema
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -22,6 +25,16 @@ templates.env.filters["tojson"] = lambda v, indent=2: json.dumps(
     v, ensure_ascii=False, indent=indent)
 templates.env.filters["tojsonc"] = lambda v: json.dumps(
     v, ensure_ascii=False, separators=(",", ":"))
+
+
+def _html_json(v):
+    """嵌入 <script> 的 JSON：转义 <, >, &，避免 </script> 提前闭合与 HTML 实体化。"""
+    text = (json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
+    return Markup(text)  # 已手工转义，不要再被 Jinja 自动转义
+
+
+templates.env.filters["script_json"] = _html_json
 
 
 def _wait_for_db(retries=40, delay=1.0):
@@ -55,7 +68,7 @@ def _get_model_or_404(name: str) -> DeviceModel:
         return DeviceModel(id=m.id, name=m.name)
 
 
-def _model_context(name: str, result=None):
+def _model_context(name: str, result=None, codec_result=None):
     with SessionLocal() as s:
         model = s.execute(select(DeviceModel).where(DeviceModel.name == name)).scalar_one_or_none()
         if model is None:
@@ -72,8 +85,61 @@ def _model_context(name: str, result=None):
         return {
             "model": model, "firmwares": firmwares, "programs": programs,
             "logs": logs, "examples": EXAMPLES, "result": result,
+            "codec_result": codec_result,
+            "codec_infos": {f.version: codec_summary(f.doc) for f in firmwares},
             "max_formats": service.MAX_FORMATS,
         }
+
+
+# ---------------- 编解码（按型号 + 已发布固件版本） ----------------
+
+def _firmware_doc(name: str, version: str):
+    """取某型号某版固件的 schema 文档；不存在/非法时抛 HTTPException。"""
+    ver_text = str(version or "").strip()
+    if not ver_text.isdigit():
+        raise HTTPException(422, f"固件版本必须是整数，收到 {version!r}")
+    with SessionLocal() as s:
+        model = s.execute(select(DeviceModel).where(DeviceModel.name == name)).scalar_one_or_none()
+        if model is None:
+            raise HTTPException(404, f"型号 {name!r} 不存在")
+        fw = s.execute(select(FirmwareFormat)
+                       .where(FirmwareFormat.model_id == model.id,
+                              FirmwareFormat.version == int(ver_text))).scalar_one_or_none()
+        if fw is None:
+            raise HTTPException(404, f"型号 {name!r} 没有固件版本 v{ver_text}")
+        return fw.doc, fw.version
+
+
+def codec_encode(name: str, version: str, message) -> dict:
+    """网页/API 共用的编码入口；返回 {ok, ...} 或 {ok: false, error, ...}。"""
+    doc, ver = _firmware_doc(name, version)
+    try:
+        codec = build_codec(parse_schema(doc))
+    except (SchemaError, CodecError) as e:
+        return {"ok": False, "kind": "encode", "version": ver,
+                "error": f"该版固件格式不支持编解码：{e}"}
+    try:
+        result = codec.encode(message)
+    except CodecError as e:
+        return {"ok": False, "kind": "encode", "version": ver, "error": str(e)}
+    result.update({"ok": True, "kind": "encode", "version": ver})
+    return result
+
+
+def codec_decode(name: str, version: str, code: str) -> dict:
+    """网页/API 共用的解码入口；返回 {ok, ...} 或 {ok: false, error, ...}。"""
+    doc, ver = _firmware_doc(name, version)
+    try:
+        codec = build_codec(parse_schema(doc))
+    except (SchemaError, CodecError) as e:
+        return {"ok": False, "kind": "decode", "version": ver,
+                "error": f"该版固件格式不支持编解码：{e}"}
+    try:
+        result = codec.decode(code)
+    except CodecError as e:
+        return {"ok": False, "kind": "decode", "version": ver, "error": str(e)}
+    result.update({"ok": True, "kind": "decode", "version": ver})
+    return result
 
 
 # ---------------- HTML 页面 ----------------
@@ -140,6 +206,45 @@ def prog_publish_html(request: Request, name: str,
     return templates.TemplateResponse(request, "model.html",
                                       _model_context(name, result=outcome))
 
+
+@app.post("/models/{name}/codec", response_class=HTMLResponse)
+def codec_html(request: Request, name: str,
+               version: str = Form(...), action: str = Form(...),
+               encode_text: str = Form(""), decode_text: str = Form("")):
+    # 两栏各有独立字段名：点「编码」用左栏，点「解码」用右栏，无需 JavaScript
+    text = (encode_text if action == "encode" else decode_text).strip()
+    if action == "encode":
+        result = {"ok": False, "kind": "encode", "version": version, "input": text}
+        if not text:
+            result["error"] = "请输入要编码的 JSON 报文"
+        else:
+            try:
+                message = json.loads(text)
+            except json.JSONDecodeError as e:
+                result["error"] = f"JSON 解析失败：{e}"
+            else:
+                outcome = codec_encode(name, version, message)
+                if outcome.get("ok"):
+                    outcome["input"] = json.dumps(message, ensure_ascii=False)
+                else:
+                    outcome["input"] = text
+                result = outcome
+    elif action == "decode":
+        result = {"ok": False, "kind": "decode", "version": version, "input": text}
+        if not text:
+            result["error"] = "请输入要解码的二进制码"
+        else:
+            outcome = codec_decode(name, version, text)
+            outcome.setdefault("input", text)
+            if outcome.get("ok"):
+                outcome["message_text"] = json.dumps(outcome["message"],
+                                                     ensure_ascii=False)
+            result = outcome
+    else:
+        result = {"ok": False, "kind": action, "version": version,
+                  "error": f"未知操作 {action!r}"}
+    ctx = _model_context(name, codec_result=result)
+    return templates.TemplateResponse(request, "model.html", ctx)
 
 # ---------------- JSON API ----------------
 
@@ -222,3 +327,38 @@ def api_publish_program(name: str, body: ProgramIn):
     model = _get_model_or_404(name)
     outcome = service.publish_program(model.id, body.program_id.strip(), body.doc)
     return _outcome_response(outcome)
+
+
+# ---------------- 编解码 JSON API ----------------
+
+class EncodeIn(BaseModel):
+    message: object
+
+
+class DecodeIn(BaseModel):
+    code: str
+
+
+def _codec_response(result: dict):
+    if result.get("ok"):
+        return JSONResponse(result, status_code=200)
+    # 格式不受支持 / 报文非法 / 码无效：说明原因
+    return JSONResponse(result, status_code=422)
+
+
+@app.post("/api/models/{name}/codec/{version}/encode")
+def api_codec_encode(name: str, version: str, body: EncodeIn):
+    return _codec_response(codec_encode(name, version, body.message))
+
+
+@app.post("/api/models/{name}/codec/{version}/decode")
+def api_codec_decode(name: str, version: str, body: DecodeIn):
+    return _codec_response(codec_decode(name, version, body.code))
+
+
+@app.get("/api/models/{name}/codec/{version}")
+def api_codec_info(name: str, version: str):
+    doc, ver = _firmware_doc(name, version)
+    info = codec_summary(doc)
+    info["version"] = ver
+    return JSONResponse(info, status_code=200 if info.get("supported") else 422)
